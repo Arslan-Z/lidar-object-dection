@@ -1,0 +1,5 @@
+<launch>
+    <node name="adpt_detecting" pkg="object_detection" type="adpt_detecting" respawn="true" output="screen"/>  
+
+    <node type="rviz" name="rviz" pkg="rviz" args="-d $(find object_detection)/rviz/adpt_livox_detecting.rviz" />
+</launch>
