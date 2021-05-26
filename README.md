@@ -21,6 +21,3 @@ TO DO
 roslaunch object_detection adpt_detection.launch
 ```
  
- ## Contact
-
-For any questions, write to  `qingqli@utu.fi`. 
