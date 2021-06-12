@@ -23,6 +23,7 @@
 #include <sensor_msgs/PointCloud2.h>
 #include <geometry_msgs/Pose.h> 
 #include <geometry_msgs/PoseStamped.h>  
+#include <visualization_msgs/Marker.h>
 
 #include <Eigen/Dense>
 
@@ -38,30 +39,32 @@ class AdapIntegraDetector{
 
 private:
     
-    ros::NodeHandle nh;
+    ros::NodeHandle nh ;
     
     ros::Subscriber subLaserCloud;
 
-    ros::Publisher pubMapCloud; 
-    ros::Publisher pubClusters;
-    ros::Publisher pubLaserCloud2;
-    ros::Publisher pubLaserCloudFilter1;
-    ros::Publisher pubLaserCloudFilter2;
-    ros::Publisher pubObjCloud;  
-    ros::Publisher pubObjPose;
-     
-
+    ros::Publisher  pubMapCloud; 
+    ros::Publisher  pubClusters;
+    ros::Publisher  pubLaserCloud2;
+    ros::Publisher  pubLaserCloudFilter1;
+    ros::Publisher  pubLaserCloudFilter2;
+    ros::Publisher  pubObjCloud;  
+    ros::Publisher  pubObjPose;
+    ros::Publisher  pubObjbbox; 
+      
     pcl::PointCloud<PointType>::Ptr ig_Cloud_1      ; // Integrating cloud
     pcl::PointCloud<PointType>::Ptr ig_Cloud_2      ; // Integrating cloud
     pcl::PointCloud<PointType>::Ptr tmpCloud        ;
     pcl::PointCloud<PointType>::Ptr interated_Cloud ; 
-    pcl::PointCloud<PointType>::Ptr latest_Cloud ; 
-    pcl::PointCloud<PointType>::Ptr dynamic_Cloud ;
-    pcl::PointCloud<PointType>::Ptr obj_Cloud ;
-    pcl::PointCloud<PointType>::Ptr map_cloud ;
+    pcl::PointCloud<PointType>::Ptr latest_Cloud    ; 
+    pcl::PointCloud<PointType>::Ptr dynamic_Cloud   ;
+    pcl::PointCloud<PointType>::Ptr obj_Cloud       ;
+    pcl::PointCloud<PointType>::Ptr map_cloud       ;
 
-    int ig_cnt = 0;
-    bool map_built = false;
+    geometry_msgs::PoseStamped      obj_pose        ; 
+
+    int     ig_cnt = 0;
+    bool    map_built = false;
 
 public:
     AdapIntegraDetector():nh("~") { 
@@ -93,7 +96,9 @@ public:
         pubLaserCloudFilter1 = nh.advertise<pcl::PointCloud<PointType>>("/livox/ig_cloud_1_filter", 2);
         pubLaserCloudFilter2 = nh.advertise<pcl::PointCloud<PointType>>("/livox/ig_cloud_2_filter", 2);
         pubObjCloud     = nh.advertise<pcl::PointCloud<PointType>>("/livox/obj_cloud", 2);   
-        pubObjPose      = nh.advertise<geometry_msgs::PoseStamped>("/livox/obj_pose", 2);   
+        pubObjPose      = nh.advertise<geometry_msgs::PoseStamped>("/livox/obj_pose", 2); 
+
+        pubObjbbox       = nh.advertise<visualization_msgs::Marker>("/livox/obj_bbox", 2);
     }
  
 
@@ -124,8 +129,7 @@ public:
         // ROS_INFO_STREAM("Map initing ... ");
         if(ig_cnt < itg_num ){
             *interated_Cloud = *interated_Cloud + *tmpCloud;
-            ig_cnt++;
-            
+            ig_cnt++; 
             if(ig_cnt % 10 == 0){
                 ROS_INFO_STREAM("Map initing - Cloud 1 is inegrating ... " << ig_cnt << " / " << itg_num);
             }
@@ -200,55 +204,101 @@ public:
         ec.setInputCloud (dynamic_Cloud);
         ec.extract (cluster_indices);
 
+        ROS_INFO_STREAM("Found PopintCloud Cluster " <<  cluster_indices.size());
+
         pcl::PointCloud<PointType>::Ptr cloud_cluster (new pcl::PointCloud<PointType>);
         for (std::vector<pcl::PointIndices>::const_iterator it = cluster_indices.begin (); it != cluster_indices.end (); ++it)
         {
-            // pcl::PointCloud<PointType>::Ptr cloud_cluster (new pcl::PointCloud<PointType>);
-
+            // pcl::PointCloud<PointType>::Ptr cloud_cluster (new pcl::PointCloud<PointType>); 
             cloud_cluster->header.frame_id = "/livox_frame";
             for (const auto& idx : it->indices)
-            cloud_cluster->push_back ((*dynamic_Cloud)[idx]); //*
+                cloud_cluster->push_back ((*dynamic_Cloud)[idx]); 
             cloud_cluster->width = cloud_cluster->size ();
             cloud_cluster->height = 1;
             cloud_cluster->is_dense = true;
 
             ROS_INFO_STREAM("PointCloud Trajectory Clustering: "  << cloud_cluster->size () << " data points.");
             pubClusters.publish(*cloud_cluster);
-        }
+        
+ 
+            if(cloud_cluster->size() > 0 ){
+                // Find the object pose from latest frame
+                pointIdxRadiusSearch.resize(0);
+                pointRadiusSquaredDistance.resize(0);
+                kdtreePts->setInputCloud(cloud_cluster);  
 
-        if(cloud_cluster->size() > 0 ){
-            // Find the object pose from latest frame
-            pointIdxRadiusSearch.resize(0);
-            pointRadiusSquaredDistance.resize(0);
-            kdtreePts->setInputCloud(cloud_cluster);  
-
-            radius = 0.2;
-            obj_Cloud->clear();
-            for(int nIdex = 0; nIdex < latest_Cloud->points.size(); nIdex++){ 
-                if ( kdtreePts->radiusSearch(latest_Cloud->points[nIdex], radius, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0 )
-                { 
-                    obj_Cloud->points.push_back(latest_Cloud->points[nIdex]);
+                radius = 0.2;
+                obj_Cloud->clear();
+                for(int nIdex = 0; nIdex < latest_Cloud->points.size(); nIdex++){ 
+                    if ( kdtreePts->radiusSearch(latest_Cloud->points[nIdex], radius, pointIdxRadiusSearch, pointRadiusSquaredDistance) > 0 )
+                    { 
+                        obj_Cloud->points.push_back(latest_Cloud->points[nIdex]);
+                    }
                 }
+                ROS_INFO_STREAM("Publishing Object PointCloud: " << obj_Cloud->size () << " data points.");
             }
-            ROS_INFO_STREAM("Publishing Object PointCloud: " << obj_Cloud->size () << " data points.");
-            pubObjCloud.publish(*obj_Cloud);
+
+
+            // Caculate the pose and the covariance of the pose
+            Eigen::Vector4f centroid;
+            Eigen::Matrix3f covariance;
+            pcl::compute3DCentroid(*obj_Cloud, centroid);
+            pcl::computeCovarianceMatrix(*obj_Cloud, centroid, covariance);
+
+
+            if(covariance(0,0) < 0.2 && covariance(1,1) < 0.2 && covariance(2,2) < 0.2){
+                geometry_msgs::PoseStamped  obj_pose;
+                obj_pose.header.frame_id = "/livox_frame";
+                obj_pose.pose.position.x = centroid(0,0);
+                obj_pose.pose.position.y = centroid(1,0);
+                obj_pose.pose.position.z = centroid(2,0); 
+
+                //Bounding box
+                visualization_msgs::Marker marker;
+                marker.header.frame_id = "livox_frame";
+                // marker.text = bbox2d->boundingBoxes[i].Class;
+                marker.text = "car";
+                marker.header.stamp = ros::Time::now();
+                marker.id = 0;
+                marker.type = visualization_msgs::Marker::CUBE;
+                marker.action = visualization_msgs::Marker::ADD;
+                marker.lifetime = ros::Duration(1);
+                marker.pose.position.x = centroid(0,0);
+                marker.pose.position.y = centroid(1,0);
+                marker.pose.position.z = centroid(2,0);
+                marker.pose.orientation.x = 0;
+                marker.pose.orientation.y = 0;
+                marker.pose.orientation.z = 0;
+                marker.pose.orientation.w = 1;
+                marker.scale.x = covariance(0,0) * 2;
+                marker.scale.y = covariance(1,1) * 2;
+                marker.scale.z = covariance(2,2) * 2;
+                //  marker.scale.x = 3;
+                //  marker.scale.y = 2;
+                //  marker.scale.z = 2;
+                marker.color.a = 0.5;
+                marker.color.r = 0.0;
+                marker.color.g = 1.0;
+                marker.color.b = 0; 
+
+                pubObjbbox.publish(marker);
+                pubObjCloud.publish(*obj_Cloud);
+                pubObjPose.publish(obj_pose);
+            }else{
+                ROS_WARN_STREAM("Invalid UAV cluster -> covariance \n" <<  covariance);
+            }
         }
 
+    }
 
-        // Caculate the pose and the covariance of the pose
-        Eigen::Vector4f centroid;
-        Eigen::Matrix3f covariance;
-        pcl::compute3DCentroid(*obj_Cloud, centroid);
-        pcl::computeCovarianceMatrix(*obj_Cloud, centroid, covariance);
+    //Received the object_poses, current obj_covariance, publish the most probablity object pose
+    void obj_tracking(){
+     
+    }
 
-        std::cout << "Pose:  covariance \n" <<  covariance << std::endl;
-
-        geometry_msgs::PoseStamped  obj_pose;
-        obj_pose.header.frame_id = "/livox_frame";
-        obj_pose.pose.position.x = centroid(0,0);
-        obj_pose.pose.position.y = centroid(1,0);
-        obj_pose.pose.position.z = centroid(2,0); 
-        pubObjPose.publish(obj_pose);
+    //Take a trajectory which is composed of serveral pointcloud. Then check the covariance of each
+    // pointcloud to verify it's ability  
+    void traj_verify(){
 
     }
 
